@@ -98,21 +98,34 @@ async function generateWithChatCompletions(
   prompt: string,
   model: string
 ): Promise<Uint8Array> {
+  const useStream = process.env.OPENAI_IMAGE_CHAT_STREAM === "true";
+
+  const body: Record<string, any> = {
+    model,
+    messages: [{ role: "user", content: prompt }],
+  };
+
+  if (useStream) {
+    body.stream = true;
+    body.modalities = ["text", "image"];
+  }
+
   const res = await fetch(`${baseURL}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: prompt }],
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`OpenAI API error: ${err}`);
+  }
+
+  if (useStream) {
+    return parseStreamingImageResponse(res);
   }
 
   const result = (await res.json()) as { choices: Array<{ message: { content: string } }> };
@@ -124,6 +137,96 @@ async function generateWithChatCompletions(
   }
 
   throw new Error("No image found in chat completions response");
+}
+
+async function parseStreamingImageResponse(res: Response): Promise<Uint8Array> {
+  const text = await res.text();
+  const b64Fragments: string[] = [];
+  const imageUrls: string[] = [];
+
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const data = trimmed.slice(5).trim();
+    if (data === "[DONE]") continue;
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    const choices = parsed?.choices;
+    if (!Array.isArray(choices)) continue;
+
+    for (const choice of choices) {
+      const delta = choice?.delta;
+      if (!delta) continue;
+
+      const content = delta.content;
+      if (typeof content === "string") {
+        // Check for markdown image syntax: ![...](url)
+        const mdMatch = content.match(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/);
+        if (mdMatch) imageUrls.push(mdMatch[1]!);
+
+        // Check for base64 image data
+        const b64Match = content.match(/data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/);
+        if (b64Match) b64Fragments.push(b64Match[1]!);
+      }
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part?.type === "image" || part?.type === "image_url") {
+            const url = part?.image_url?.url || part?.url;
+            if (typeof url === "string") {
+              if (url.startsWith("data:image/")) {
+                const m = url.match(/base64,([A-Za-z0-9+/=]+)/);
+                if (m) b64Fragments.push(m[1]!);
+              } else if (url.startsWith("http")) {
+                imageUrls.push(url);
+              }
+            }
+          }
+          const inlineData = part?.inline_data || part?.inlineData;
+          if (inlineData?.data) b64Fragments.push(inlineData.data);
+          if (part?.b64_json) b64Fragments.push(part.b64_json);
+          if (part?.image?.data) b64Fragments.push(part.image.data);
+        }
+      }
+
+      if (delta.image?.data) b64Fragments.push(delta.image.data);
+      if (delta.inline_data?.data) b64Fragments.push(delta.inline_data.data);
+    }
+  }
+
+  // Return base64 data if available
+  if (b64Fragments.length > 0) {
+    return Uint8Array.from(Buffer.from(b64Fragments[0]!, "base64"));
+  }
+
+  // Download image from URL
+  if (imageUrls.length > 0) {
+    const imgRes = await fetch(imageUrls[0]!);
+    if (!imgRes.ok) throw new Error(`Failed to download image: ${imgRes.status}`);
+    const buf = await imgRes.arrayBuffer();
+    return new Uint8Array(buf);
+  }
+
+  // Fallback: global scan
+  const globalMd = text.match(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/);
+  if (globalMd) {
+    const imgRes = await fetch(globalMd[1]!);
+    if (!imgRes.ok) throw new Error(`Failed to download image: ${imgRes.status}`);
+    const buf = await imgRes.arrayBuffer();
+    return new Uint8Array(buf);
+  }
+
+  const globalB64 = text.match(/data:image\/[^;]+;base64,([A-Za-z0-9+/=\r\n]+)/);
+  if (globalB64) {
+    return Uint8Array.from(Buffer.from(globalB64[1]!.replace(/[\r\n]/g, ""), "base64"));
+  }
+
+  throw new Error("No image found in streaming chat completions response");
 }
 
 async function generateWithOpenAIGenerations(

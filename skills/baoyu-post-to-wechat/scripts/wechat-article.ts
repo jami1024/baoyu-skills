@@ -5,6 +5,13 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { launchChrome, tryConnectExisting, findExistingChromeDebugPort, getPageSession, waitForNewTab, clickElement, typeText, evaluate, sleep, getAccountProfileDir, type ChromeSession, type CdpConnection } from './cdp.ts';
 import { loadWechatExtendConfig, resolveAccount } from './wechat-extend-config.ts';
+import {
+  buildExpectedBodySnippet,
+  canOpenArticleComposer,
+  extractEditorHtmlContent,
+  shouldSaveDraft,
+  shouldUseDomInjectionFallback,
+} from './wechat-article.helpers.ts';
 
 const WECHAT_URL = 'https://mp.weixin.qq.com/';
 
@@ -46,6 +53,28 @@ async function waitForElement(session: ChromeSession, selector: string, timeoutM
   while (Date.now() - start < timeoutMs) {
     const found = await evaluate<boolean>(session, `!!document.querySelector('${selector}')`);
     if (found) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+async function waitForArticleComposerEntry(
+  session: ChromeSession,
+  timeoutMs = 20_000,
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const state = await evaluate<{ menuExists: boolean; bodyText: string }>(session, `
+      (function() {
+        return {
+          menuExists: !!document.querySelector('.new-creation__menu'),
+          bodyText: document.body?.innerText || '',
+        };
+      })()
+    `);
+    if (canOpenArticleComposer(state)) {
+      return true;
+    }
     await sleep(500);
   }
   return false;
@@ -400,6 +429,47 @@ async function removeExtraEmptyLineAfterImage(session: ChromeSession): Promise<b
   return removed;
 }
 
+async function readEditorText(session: ChromeSession): Promise<string> {
+  return await evaluate<string>(session, `
+    (function() {
+      const editor =
+        document.querySelector('.ProseMirror[contenteditable=true]') ||
+        document.querySelector('.ProseMirror') ||
+        document.querySelector('.js_pmEditorArea');
+      if (!editor) return '';
+      return editor.innerText || editor.textContent || '';
+    })()
+  `);
+}
+
+async function injectHtmlIntoEditor(session: ChromeSession, html: string): Promise<string> {
+  return await evaluate<string>(session, `
+    (function() {
+      const html = ${JSON.stringify(html)};
+      const pm =
+        document.querySelector('.ProseMirror[contenteditable=true]') ||
+        document.querySelector('.ProseMirror');
+      if (pm) {
+        pm.focus();
+        pm.innerHTML = html;
+        pm.dispatchEvent(new Event('input', { bubbles: true }));
+        pm.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'ProseMirror';
+      }
+
+      const oldEditor = document.querySelector('.js_pmEditorArea');
+      if (oldEditor) {
+        oldEditor.innerHTML = html;
+        oldEditor.dispatchEvent(new Event('input', { bubbles: true }));
+        oldEditor.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'js_pmEditorArea';
+      }
+
+      return 'editor_not_found';
+    })()
+  `);
+}
+
 export async function postArticle(options: ArticleOptions): Promise<void> {
   const { title, content, htmlFile, markdownFile, theme, color, citeStatus = true, author, summary, images = [], submit = false, profileDir, cdpPort } = options;
   let { contentImages = [] } = options;
@@ -508,7 +578,7 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
     await sleep(5000);
 
     // Wait for menu to be ready
-    const menuReady = await waitForElement(session, '.new-creation__menu', 40_000);
+    const menuReady = await waitForArticleComposerEntry(session, 30_000);
     if (!menuReady) throw new Error('Home page menu did not load');
 
     const targets = await cdp.send<{ targetInfos: Array<{ targetId: string; url: string; type: string }> }>('Target.getTargets');
@@ -564,6 +634,9 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
     await sleep(500);
 
     if (effectiveHtmlFile && fs.existsSync(effectiveHtmlFile)) {
+      const sourceHtml = fs.readFileSync(effectiveHtmlFile, 'utf-8');
+      const expectedBodySnippet = buildExpectedBodySnippet(sourceHtml);
+      const editorHtml = extractEditorHtmlContent(sourceHtml);
       console.log(`[wechat] Copying HTML content from: ${effectiveHtmlFile}`);
       await copyHtmlFromBrowser(cdp, effectiveHtmlFile, contentImages);
       await sleep(500);
@@ -571,18 +644,19 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
       await pasteFromClipboardInEditor(session);
       await sleep(3000);
 
-      const editorHasContent = await evaluate<boolean>(session, `
-        (function() {
-          const editor = document.querySelector('.ProseMirror');
-          if (!editor) return false;
-          const text = editor.innerText?.trim() || '';
-          return text.length > 0;
-        })()
-      `);
-      if (editorHasContent) {
+      let editorText = await readEditorText(session);
+      if (shouldUseDomInjectionFallback(editorText, expectedBodySnippet)) {
+        console.warn('[wechat] Body paste verification failed: expected正文片段未命中，falling back to DOM injection.');
+        const injectionTarget = await injectHtmlIntoEditor(session, editorHtml);
+        console.log(`[wechat] DOM injection target: ${injectionTarget}`);
+        await sleep(1000);
+        editorText = await readEditorText(session);
+      }
+
+      if (!shouldUseDomInjectionFallback(editorText, expectedBodySnippet)) {
         console.log('[wechat] Body content verified OK.');
       } else {
-        console.warn('[wechat] Body content verification failed: editor appears empty after paste.');
+        console.warn('[wechat] Body content verification failed: editor did not contain expected正文片段 after fallback.');
       }
 
       if (contentImages.length > 0) {
@@ -669,16 +743,20 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
       }
     }
 
-    console.log('[wechat] Saving as draft...');
-    await evaluate(session, `document.querySelector('#js_submit button').click()`);
-    await sleep(3000);
+    if (shouldSaveDraft(submit)) {
+      console.log('[wechat] Saving as draft...');
+      await evaluate(session, `document.querySelector('#js_submit button').click()`);
+      await sleep(3000);
 
-    const saved = await evaluate<boolean>(session, `!!document.querySelector('.weui-desktop-toast')`);
-    if (saved) {
-      console.log('[wechat] Draft saved successfully!');
+      const saved = await evaluate<boolean>(session, `!!document.querySelector('.weui-desktop-toast')`);
+      if (saved) {
+        console.log('[wechat] Draft saved successfully!');
+      } else {
+        console.log('[wechat] Waiting for save confirmation...');
+        await sleep(5000);
+      }
     } else {
-      console.log('[wechat] Waiting for save confirmation...');
-      await sleep(5000);
+      console.log('[wechat] Article composed (preview mode). Add --submit to save as draft.');
     }
 
     console.log('[wechat] Done. Browser window left open.');
